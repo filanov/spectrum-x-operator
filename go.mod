@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/Mellanox/nvidia-k8s-ipam v0.3.7
 	github.com/caarlos0/env/v11 v11.3.1
+	github.com/containernetworking/cni v1.2.3
 	github.com/golang/mock v1.6.0
 	github.com/k8snetworkplumbingwg/network-attachment-definition-client v1.7.6
 	github.com/k8snetworkplumbingwg/sriov-network-operator v1.5.1-0.20250406123337-cd029e38821c
@@ -33,7 +34,6 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clarketm/json v1.17.1 // indirect
-	github.com/containernetworking/cni v1.2.3 // indirect
 	github.com/coreos/fcct v0.5.0 // indirect
 	github.com/coreos/go-json v0.0.0-20230131223807-18775e0fb4fb // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
