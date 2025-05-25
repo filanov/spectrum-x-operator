@@ -17,6 +17,7 @@ package controller
 
 import (
 	"fmt"
+	"net"
 
 	"github.com/Mellanox/spectrum-x-operator/pkg/config"
 	"github.com/Mellanox/spectrum-x-operator/pkg/exec"
@@ -31,6 +32,7 @@ type FlowsAPI interface {
 	DeleteBridgeDefaultFlows(bridge string) error
 	AddHostRailFlows(bridge string, pf string, rail config.HostRail, infraRailSubnet string) error
 	AddPodRailFlows(cookie uint64, rail *config.HostRail, cfg *config.Config, ns *netdefv1.NetworkStatus, bridge, iface string) error
+	AddPodRailFlowsCNI(cookie uint64, vf, bridge, pf, podIP, podMAC, gw string) error
 	DeletePodRailFlows(cookie uint64, bridge string) error
 }
 
@@ -123,7 +125,7 @@ func (f *Flows) AddPodRailFlows(cookie uint64, rail *config.HostRail, cfg *confi
 
 	bridgeMAC := link.Attrs().HardwareAddr
 
-	torMAC, err := f.getTorMac(rail)
+	torMAC, err := f.getTorMac(rail.PeerLeafPortIP)
 	if err != nil {
 		return fmt.Errorf("failed to get tor mac for rail [%s]: %v", rail, err)
 	}
@@ -150,26 +152,152 @@ func (f *Flows) AddPodRailFlows(cookie uint64, rail *config.HostRail, cfg *confi
 	return nil
 }
 
+func (f *Flows) AddPodRailFlowsCNI(cookie uint64, vf, bridge, pf, podIP, podMAC, gw string) error {
+	// ovs-ofctl add-flow -OOpenFlow13 $RAIL_BR "table=0, arp,arp_tpa=${CONTAINER_IP} actions=output:${REP_PORT}"
+	flow := fmt.Sprintf(`ovs-ofctl add-flow %s "table=0,priority=%d,cookie=0x%x,arp,arp_tpa=%s,actions=output:%s"`,
+		bridge, defaultPriority, cookie, podIP, vf)
+	if _, err := f.Exec.Execute(flow); err != nil {
+		return fmt.Errorf("failed to add flows to bridge [%s]: %v", bridge, err)
+	}
+
+	link, err := f.NetlinkLib.LinkByName(bridge)
+	if err != nil {
+		return fmt.Errorf("failed to get interface %s: %w", bridge, err)
+	}
+
+	bridgeMAC := link.Attrs().HardwareAddr
+
+	addrs, err := f.NetlinkLib.IPv4Addresses(link)
+	if err != nil {
+		return fmt.Errorf("failed to get addresses for interface %s: %w", bridge, err)
+	}
+
+	if len(addrs) != 2 {
+		return fmt.Errorf("expected 2 addresses for interface %s, got %s", bridge, addrs)
+	}
+
+	var railIP, railSubnet string
+	for _, addr := range addrs {
+		if addr.IP.String() != gw {
+			railSubnet = addr.IPNet.String()
+			railIP = addr.IP.String()
+			break
+		}
+	}
+
+	if railSubnet == "" {
+		return fmt.Errorf("failed to get tor ip for bridge [%s]", bridge)
+	}
+
+	ips, err := getIPsFromCIDR(railSubnet)
+	if err != nil {
+		return fmt.Errorf("failed to get ips from cidr [%s]: %v", railSubnet, err)
+	}
+
+	if len(ips) != 2 {
+		return fmt.Errorf("expected 2 ips for cidr [%s], got %s", railSubnet, ips)
+	}
+
+	var torIP string
+
+	for _, ip := range ips {
+		if ip != railIP {
+			torIP = ip
+			break
+		}
+	}
+
+	torMAC, err := f.getTorMac(torIP)
+	if err != nil {
+		return fmt.Errorf("failed to get tor mac for bridge [%s]: %v", bridge, err)
+	}
+
+	// ovs-ofctl add-flow -OOpenFlow13 $RAIL_BR "table=0,ip,in_port=${REP_PORT},
+	// actions=mod_dl_src=${ROUTER_MAC}, mod_dl_dst=${ROUTER_NH_MAC},dec_ttl, output=${PF_PORT}"
+	// setting the priority to avoid conflicts with a more specific flows
+	flow = fmt.Sprintf(`ovs-ofctl add-flow %s "table=0,priority=%d,cookie=0x%x,ip,in_port=%s,`+
+		`actions=mod_dl_src=%s,mod_dl_dst=%s,dec_ttl,output:%s"`,
+		bridge, defaultPriority/2, cookie, vf, bridgeMAC, torMAC, pf)
+	if _, err := f.Exec.Execute(flow); err != nil {
+		return fmt.Errorf("failed to add flows to bridge [%s]: %v", bridge, err)
+	}
+
+	// ovs-ofctl add-flow -OOpenFlow13 $RAIL_BR "table=0,ip,nw_dst=${CONTAINER_IP},
+	// actions=mod_dl_src=${ROUTER_MAC},mod_dl_dst=${CONTAINER_MAC},dec_ttl, output=${REP_PORT}"
+	flow = fmt.Sprintf(`ovs-ofctl add-flow %s "table=0,priority=%d,cookie=0x%x,ip,nw_dst=%s,`+
+		`actions=mod_dl_src=%s,mod_dl_dst=%s,dec_ttl,output:%s"`,
+		bridge, defaultPriority, cookie, podIP, bridgeMAC, podMAC, vf)
+	if _, err := f.Exec.Execute(flow); err != nil {
+		return fmt.Errorf("failed to add flows to bridge [%s]: %v", bridge, err)
+	}
+
+	return nil
+}
+
 func (f *Flows) DeletePodRailFlows(cookie uint64, bridge string) error {
 	flow := fmt.Sprintf(`ovs-ofctl del-flows %s cookie=0x%x/-1`, bridge, cookie)
 	_, err := f.Exec.Execute(flow)
 	return err
 }
 
-func (f *Flows) getTorMac(rail *config.HostRail) (string, error) {
+func (f *Flows) getTorMac(torIP string) (string, error) {
 	// nsenter --target 1 --net -- arping 2.0.0.3 -c 1
 	// nsenter --target 1 --net -- ip neighbor | grep 2.0.0.3 | awk '{print $5}'
 	// TODO: check why it always return an error
 	reply, _ := f.Exec.ExecutePrivileged(fmt.Sprintf(`arping %s -c 1 | grep "reply from" | awk '{print $5}' | tr -d '[]'`,
-		rail.PeerLeafPortIP))
+		torIP))
 	// if err != nil {
 	// 	logr.Error(err, fmt.Sprintf("failed to exec: arping %s -c 1", rail.Tor))
 	// 	return "", err
 	// }
 
 	if reply == "" {
-		return "", fmt.Errorf("no reply from arping %s", rail.PeerLeafPortIP)
+		return "", fmt.Errorf("no reply from arping %s", torIP)
 	}
 
 	return reply, nil
+}
+
+// GetIPsFromCIDR returns a slice of all IP addresses in the given CIDR subnet
+func getIPsFromCIDR(cidr string) ([]string, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CIDR: %v", err)
+	}
+
+	var ips []string
+
+	// Get the network address
+	ip := ipNet.IP.Mask(ipNet.Mask)
+
+	// Calculate the number of host bits
+	ones, bits := ipNet.Mask.Size()
+	hostBits := bits - ones
+
+	// Calculate total number of addresses (2^hostBits)
+	totalAddresses := 1 << hostBits
+
+	// Generate all IP addresses in the range
+	for i := 0; i < totalAddresses; i++ {
+		// Create a copy of the network IP
+		currentIP := make(net.IP, len(ip))
+		copy(currentIP, ip)
+
+		// Add the offset to get the current IP
+		addOffset(currentIP, i)
+
+		ips = append(ips, currentIP.String())
+	}
+
+	return ips, nil
+}
+
+// addOffset adds an integer offset to an IP address
+func addOffset(ip net.IP, offset int) {
+	// Work backwards through the IP address bytes
+	for i := len(ip) - 1; i >= 0 && offset > 0; i-- {
+		sum := int(ip[i]) + offset
+		ip[i] = byte(sum & 0xFF)
+		offset = sum >> 8
+	}
 }

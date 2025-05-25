@@ -115,11 +115,11 @@ func (r *SRIOVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	err = r.reconcileOVSNetwork(ctx, spectrumXConfig)
-	if err != nil {
-		logr.Info("Failed to reconcile OVSNetwork")
-		return ctrl.Result{}, err
-	}
+	// err = r.reconcileOVSNetwork(ctx, spectrumXConfig)
+	// if err != nil {
+	// 	logr.Info("Failed to reconcile OVSNetwork")
+	// 	return ctrl.Result{}, err
+	// }
 
 	return ctrl.Result{}, nil
 }
