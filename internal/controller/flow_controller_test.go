@@ -199,6 +199,28 @@ var _ = Describe("Pod Controller", func() {
 		})
 	})
 
+	It("pod already deleted, interface will not be found, do not fail reconciliation", func() {
+		netStatusStr, err := json.Marshal(defaultNetStatus)
+		Expect(err).Should(BeNil())
+		pod.Annotations = map[string]string{netdefv1.NetworkStatusAnnot: string(netStatusStr)}
+		Expect(k8sClient.Create(ctx, pod)).Should(Succeed())
+
+		// rail1
+		execMock.EXPECT().
+			Execute("ovs-vsctl --no-heading --columns=name find Port external_ids:contIface=net1 external_ids:contPodUid="+string(pod.UID)).
+			Return("", nil).Times(1)
+
+		// rail2
+		execMock.EXPECT().
+			Execute("ovs-vsctl --no-heading --columns=name find Port external_ids:contIface=net2 external_ids:contPodUid="+string(pod.UID)).
+			Return("", nil)
+
+		pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		result, err := flowController.Reconcile(ctx, pod)
+		Expect(err).Should(Succeed())
+		Expect(result).To(Equal(reconcile.Result{}))
+	})
+
 	Context("valid config", func() {
 		BeforeEach(func() {
 			netStatusStr, err := json.Marshal(defaultNetStatus)
@@ -224,6 +246,24 @@ var _ = Describe("Pod Controller", func() {
 
 			result, err := flowController.Reconcile(ctx, pod)
 			Expect(err).Should(Succeed())
+			Expect(result).To(Equal(reconcile.Result{}))
+		})
+
+		It("get vf rep not found", func() {
+			// rail1
+			execMock.EXPECT().
+				Execute("ovs-vsctl --no-heading --columns=name find Port external_ids:contIface=net1 external_ids:contPodUid="+string(pod.UID)).
+				Return("", nil)
+
+			// rail2
+			execMock.EXPECT().
+				Execute("ovs-vsctl --no-heading --columns=name find Port external_ids:contIface=net2 external_ids:contPodUid="+string(pod.UID)).
+				Return("pod-vf-2", nil)
+			execMock.EXPECT().Execute("ovs-vsctl iface-to-br pod-vf-2").Return("br-rail2", nil)
+			flowsMock.EXPECT().AddPodRailFlows(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+			result, err := flowController.Reconcile(ctx, pod)
+			Expect(err).Should(HaveOccurred())
 			Expect(result).To(Equal(reconcile.Result{}))
 		})
 

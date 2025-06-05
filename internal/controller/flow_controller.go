@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"strings"
 
 	"github.com/Mellanox/spectrum-x-operator/pkg/exec"
 
@@ -114,9 +115,21 @@ func (r *FlowReconciler) handlePodFlows(ctx context.Context, pod *corev1.Pod, re
 			continue
 		}
 
+		if rep == "" && pod.DeletionTimestamp != nil {
+			logr.Info(fmt.Sprintf("pod [%s] was already deleted, skipping interface %s",
+				pod.UID, ns.Interface))
+			continue
+		}
+
+		if rep == "" {
+			errs = multierr.Append(errs, fmt.Errorf("failed to get rep for interface %s", ns.Interface))
+			logr.Error(fmt.Errorf("failed to get rep for interface %s", ns.Interface), "failed to get rep for interface")
+			continue
+		}
+
 		bridge, err := r.repToBridge(rep)
 		if err != nil {
-			logr.Error(err, fmt.Sprintf("failed to get bridge for interface %s", ns.Interface))
+			logr.Error(err, fmt.Sprintf("failed to get bridge for interface %s, rep: %s", ns.Interface, rep))
 			errs = multierr.Append(errs, err)
 			continue
 		}
@@ -139,9 +152,11 @@ func (r *FlowReconciler) handlePodFlows(ctx context.Context, pod *corev1.Pod, re
 }
 
 func (r *FlowReconciler) getIfaceRep(iface string, podUID types.UID) (string, error) {
-	return r.Exec.Execute(fmt.Sprintf(`ovs-vsctl --no-heading --columns=name find Port `+
+	// this call doesn't return an error if the port is not found
+	rep, err := r.Exec.Execute(fmt.Sprintf(`ovs-vsctl --no-heading --columns=name find Port `+
 		`external_ids:contIface=%s external_ids:contPodUid=%s`,
 		iface, podUID))
+	return strings.TrimSpace(rep), err
 }
 
 func (r *FlowReconciler) repToBridge(rep string) (string, error) {
